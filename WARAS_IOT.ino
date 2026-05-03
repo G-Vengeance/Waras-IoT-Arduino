@@ -1,5 +1,5 @@
 #include <WiFi.h>
-#include <WiFiManager.h>      
+#include <WiFiManager.h>
 #include <FirebaseESP32.h>
 #include <ModbusMaster.h>
 #include <time.h>
@@ -7,7 +7,7 @@
 
 // --- KONFIGURASI WIFI & FIREBASE ---
 #define FIREBASE_HOST "https://waras-iot-default-rtdb.asia-southeast1.firebasedatabase.app"
-#define FIREBASE_AUTH "UkWDgNUkux87bEuWyWcqF6Q9voKwTLck3YCL9n8G"
+#define FIREBASE_AUTH "####################################"
 
 // --- PIN DEFINITIONS ---
 #define RXD2 16 // Modbus RX
@@ -21,21 +21,25 @@ float calibration_value = 21.34;
 int buffer_arr[10], temp;
 unsigned long int avgval;
 
-// Timer History 
+// Timer History (1 Menit)
 unsigned long lastHistorySave = 0;
 const unsigned long historyInterval = 60000; 
 
-// --- VARIABLES AUTO MODE ---
+// --- VARIABLES AUTO MODE (STATE MACHINE) ---
 Servo pelontarServo;
 bool autoModeActive = false;
 unsigned long startTime = 0;
+int stepAuto = 0;
 
 // Pengaturan Durasi Siklus Otomatis
-int feederDuration = 2000;    // Lama Relay Feeder menyala agar pakan turun
-int pauseDuration = 1000;     // Jeda santai sebelum Servo Pelontar menembak
-int pelontarDuration = 1000;  // Lama Servo menahan posisi tembak sebelum kembali
+int feederDuration = 3000;    // 1. Lama Relay Feeder menyala (3 Detik)
+int pauseDuration = 2000;     // 2. Jeda waktu SETELAH feeder mati, sebelum pelontar menembak (2 detik)
+int pelontarDuration = 1000;  // 3. Lama Dinamo menahan posisi tembak sebelum kembali (1 detik)
 
-int stepAuto = 0;
+// --- VARIABLES TRIGGER DO ---
+float doThreshold = 0; // Ambang batas DO (Misal: Pakan keluar jika DO >= 5.0)
+unsigned long lastDOFeedTime = 0;
+const unsigned long doFeedCooldown = 3600000; // Cooldown 1 jam (dalam milidetik) agar tidak spam pakan '7200000' untuk 2 jam delay
 
 // --- OBJECTS ---
 ModbusMaster node;
@@ -47,27 +51,22 @@ FirebaseAuth auth;
 void setup() {
   Serial.begin(115200);
 
-  // 1. Inisialisasi Aktuator Relay Feeder (ACTIVE-LOW: HIGH=OFF, LOW=ON)
+  // Inisialisasi Aktuator Relay Feeder (ACTIVE-LOW)
   pinMode(FEEDER_RELAY_PIN, OUTPUT);
-  digitalWrite(FEEDER_RELAY_PIN, HIGH); 
+  digitalWrite(FEEDER_RELAY_PIN, HIGH); // Posisi awal mati
 
-  // 2. Inisialisasi Servo Pelontar
+  // Inisialisasi Servo Pelontar
   pelontarServo.attach(PELONTAR_SERVO_PIN);
   pelontarServo.write(48); // Posisi default: Siaga (48 derajat)
 
-  // 3. Inisialisasi Modbus
+  // Inisialisasi Modbus
   Serial2.begin(4800, SERIAL_8N1, RXD2, TXD2);
   delay(2000);
   node.begin(1, Serial2);
 
-  // ======================================================================
-  // 4. KONEKSI WIFI DINAMIS DENGAN WIFIMANAGER
-  // ======================================================================
+  // WiFiManager Setup
   WiFiManager wm;
-
-  // Membuat Access Point bernama "WARAS-Setup" jika gagal terhubung
   bool res = wm.autoConnect("WARAS-Setup"); 
-
   if(!res) {
     Serial.println("Gagal terhubung. Restart dalam 5 detik...");
     delay(5000);
@@ -75,24 +74,18 @@ void setup() {
   } 
   else {
     Serial.println("\nWiFi Connected!");
-    Serial.print("Alamat IP: ");
-    Serial.println(WiFi.localIP());
   }
-  // ======================================================================
 
-  // 5. Sinkronisasi Waktu (NTP)
+  // Sinkronisasi Waktu (NTP)
   configTime(25200, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.print("Syncing time...");
   struct tm timeinfo;
   int retry = 0;
   while (!getLocalTime(&timeinfo) && retry < 10) { 
     delay(500);
-    Serial.print(".");
     retry++;
   }
-  Serial.println("\nReady, Tuan Muda!");
 
-  // 6. Konfigurasi Firebase
+  // Konfigurasi Firebase
   config.host = FIREBASE_HOST;
   config.signer.tokens.legacy_token = FIREBASE_AUTH;
   Firebase.begin(&config, &auth);
@@ -118,98 +111,105 @@ void loop() {
     currentData.set("temperature", temperature);
     currentData.set("timestamp/.sv", "timestamp"); 
 
-    if (Firebase.setJSON(firebaseData, "/sensors/current", currentData)) {
-       Serial.println("📡 Live Update Berhasil!");
-    }
+    Firebase.setJSON(firebaseData, "/sensors/current", currentData);
 
     if (millis() - lastHistorySave >= historyInterval) {
       String historyPath = "/sensors/history/" + getYearMonth();
       if (Firebase.pushJSON(firebaseData, historyPath, currentData)) {
         lastHistorySave = millis();
-        Serial.println("📂 History Saved to: " + historyPath);
       }
     }
   }
 
-  // --- C. TERIMA KONTROL DARI FIREBASE ---
+  // --- C. TERIMA KONTROL DARI FIREBASE & LOGIKA TRIGGER ---
   if (Firebase.getString(firebaseControl, "/control/mode")) {
     String mode = firebaseControl.stringData();
 
     if (mode == "manual") {
-      autoModeActive = false; // Matikan state auto jika dipindah ke manual
+      autoModeActive = false; // Matikan state auto
       
-      // 1. Kontrol Feeder 
+      // Kontrol Feeder Manual
       if (Firebase.getBool(firebaseControl, "/control/actuators/feeder")) {
         digitalWrite(FEEDER_RELAY_PIN, firebaseControl.boolData() ? LOW : HIGH);
       }
-      
-      // 2. Kontrol Pelontar 
+      // Kontrol Pelontar Manual
       if (Firebase.getBool(firebaseControl, "/control/actuators/pelontar")) {
-        bool isPelontarOn = firebaseControl.boolData();
-        pelontarServo.write(isPelontarOn ? 0 : 48); // True = Tembak (0°), False = Siaga (48°)
+        pelontarServo.write(firebaseControl.boolData() ? 0 : 48);
       }
     } 
     else if (mode == "otomatis" || mode == "auto") {
-      // Logika Trigger Pakan Otomatis dari Dashboard
+      
+      // 1. Logika Trigger Otomatis dari Tombol Dashboard
       if (Firebase.getBool(firebaseControl, "/control/actuators/start_feed")) {
          if (firebaseControl.boolData() == true && !autoModeActive) {
             autoModeActive = true;
             stepAuto = 0;
             startTime = millis();
-            // Matikan kembali trigger di Firebase agar siklus tidak berulang terus-menerus
             Firebase.setBool(firebaseData, "/control/actuators/start_feed", false);
          }
+      }
+
+      // 2. Logika Trigger Otomatis berdasarkan SENSOR DO
+      // Membaca threshold dari sensor dan mengecek apakah cooldown sudah lewat
+      if (doConcentration >= doThreshold && !autoModeActive) {
+        unsigned long currentMillis = millis();
+        // Cek apakah ini pertama kali jalan (last == 0) atau sudah melewati waktu cooldown
+        if (lastDOFeedTime == 0 || (currentMillis - lastDOFeedTime >= doFeedCooldown)) {
+          autoModeActive = true;
+          stepAuto = 0;
+          startTime = currentMillis;
+          lastDOFeedTime = currentMillis; // Catat waktu pemberian pakan terakhir
+          Serial.println("⚠️ Ambang batas DO tercapai! Pemicu pakan otomatis aktif.");
+        }
       }
     }
   }
 
-  // --- D. STATE MACHINE ---
+  // --- D. STATE MACHINE (MODE AUTO SIKLUS PAKAN) ---
   if (autoModeActive) {
     unsigned long now = millis();
 
     switch (stepAuto) {
       case 0: // 1. Buka Feeder 
-        Serial.println("AUTO: Feeder (Relay) ON, pakan turun...");
-        digitalWrite(FEEDER_RELAY_PIN, LOW);
-        startTime = now;
+        Serial.println("AUTO: Feeder ON (Pakan turun...)");
+        digitalWrite(FEEDER_RELAY_PIN, LOW); // Relay Nyala
+        startTime = now; // Mulai hitung waktu feeder
         stepAuto = 1;
         break;
 
-      case 1: // 2. Tutup Feeder 
+      case 1: // 2. Tunggu 3 Detik, lalu Tutup Feeder
         if (now - startTime >= feederDuration) {
-          Serial.println("AUTO: Feeder (Relay) OFF.");
-          digitalWrite(FEEDER_RELAY_PIN, HIGH);
-          startTime = now;
+          Serial.println("AUTO: Feeder OFF. Memulai hitung mundur jeda...");
+          digitalWrite(FEEDER_RELAY_PIN, HIGH); // Relay Mati
+          startTime = now; // Mulai hitung waktu jeda (Dihitung SETELAH mati)
           stepAuto = 2;
         }
         break;
 
-      case 2: // 3. Jeda selesai, Servo Pelontar menembak pakan
+      case 2: // 3. Tunggu Jeda Selesai, lalu Servo Menembak
         if (now - startTime >= pauseDuration) {
-          Serial.println("AUTO: Pelontar (Servo) Menembak! (0°)");
+          Serial.println("AUTO: Jeda selesai, Pelontar Menembak!");
           pelontarServo.write(0);
-          startTime = now;
+          startTime = now; // Mulai hitung waktu pelontar menahan posisi
           stepAuto = 3;
         }
         break;
 
-      case 3: // 4. Servo Pelontar kembali ke posisi awal, Siklus Selesai
+      case 3: // 4. Servo Kembali, Siklus Selesai
         if (now - startTime >= pelontarDuration) {
-          Serial.println("AUTO: Pelontar (Servo) Kembali (48°). Siklus Pakan Selesai!");
+          Serial.println("AUTO: Pelontar kembali. Siklus Selesai!");
           pelontarServo.write(48);
-          autoModeActive = false; 
+          autoModeActive = false; // Kembalikan ke standby
         }
         break;
     }
   }
 
   Serial.printf("📊 PH: %.2f | DO: %.2f | Temp: %.2f | Mode: %s\n", phValue, doConcentration, temperature, firebaseControl.stringData().c_str());
-  
   delay(1000); 
 }
 
 // --- FUNCTIONS ---
-
 String getYearMonth() {
   struct tm timeinfo;
   if(!getLocalTime(&timeinfo)) return "2026-04"; 
