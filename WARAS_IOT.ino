@@ -1,5 +1,5 @@
 #include <WiFi.h>
-#include <WiFiManager.h>      // <-- Tambahkan library WiFiManager
+#include <WiFiManager.h>      
 #include <FirebaseESP32.h>
 #include <ModbusMaster.h>
 #include <time.h>
@@ -21,16 +21,16 @@ float calibration_value = 21.34;
 int buffer_arr[10], temp;
 unsigned long int avgval;
 
-// Timer History (1 Menit, sesuai permintaan Tuan Muda)
+// Timer History 
 unsigned long lastHistorySave = 0;
 const unsigned long historyInterval = 60000; 
 
-// --- VARIABLES AUTO MODE (STATE MACHINE) ---
+// --- VARIABLES AUTO MODE ---
 Servo pelontarServo;
 bool autoModeActive = false;
 unsigned long startTime = 0;
 
-// Pengaturan Durasi Siklus Otomatis (Bisa disesuaikan Tuan Muda)
+// Pengaturan Durasi Siklus Otomatis
 int feederDuration = 2000;    // Lama Relay Feeder menyala agar pakan turun
 int pauseDuration = 1000;     // Jeda santai sebelum Servo Pelontar menembak
 int pelontarDuration = 1000;  // Lama Servo menahan posisi tembak sebelum kembali
@@ -49,7 +49,7 @@ void setup() {
 
   // 1. Inisialisasi Aktuator Relay Feeder (ACTIVE-LOW: HIGH=OFF, LOW=ON)
   pinMode(FEEDER_RELAY_PIN, OUTPUT);
-  digitalWrite(FEEDER_RELAY_PIN, HIGH); // Posisi awal mati
+  digitalWrite(FEEDER_RELAY_PIN, HIGH); 
 
   // 2. Inisialisasi Servo Pelontar
   pelontarServo.attach(PELONTAR_SERVO_PIN);
@@ -65,9 +65,6 @@ void setup() {
   // ======================================================================
   WiFiManager wm;
 
-  // Jika ingin ESP32 "lupa" Wi-Fi setiap kali dinyalakan (untuk testing), hapus comment di bawah
-  // wm.resetSettings();
-
   // Membuat Access Point bernama "WARAS-Setup" jika gagal terhubung
   bool res = wm.autoConnect("WARAS-Setup"); 
 
@@ -77,7 +74,6 @@ void setup() {
     ESP.restart();
   } 
   else {
-    // Jika berhasil terhubung!
     Serial.println("\nWiFi Connected!");
     Serial.print("Alamat IP: ");
     Serial.println(WiFi.localIP());
@@ -142,12 +138,12 @@ void loop() {
     if (mode == "manual") {
       autoModeActive = false; // Matikan state auto jika dipindah ke manual
       
-      // 1. Kontrol Feeder (Kini menggerakkan Relay di Pin 27)
+      // 1. Kontrol Feeder 
       if (Firebase.getBool(firebaseControl, "/control/actuators/feeder")) {
         digitalWrite(FEEDER_RELAY_PIN, firebaseControl.boolData() ? LOW : HIGH);
       }
       
-      // 2. Kontrol Pelontar (Kini menggerakkan Servo di Pin 12)
+      // 2. Kontrol Pelontar 
       if (Firebase.getBool(firebaseControl, "/control/actuators/pelontar")) {
         bool isPelontarOn = firebaseControl.boolData();
         pelontarServo.write(isPelontarOn ? 0 : 48); // True = Tembak (0°), False = Siaga (48°)
@@ -167,19 +163,19 @@ void loop() {
     }
   }
 
-  // --- D. STATE MACHINE (MODE AUTO SIKLUS PAKAN) ---
+  // --- D. STATE MACHINE ---
   if (autoModeActive) {
     unsigned long now = millis();
 
     switch (stepAuto) {
-      case 0: // 1. Buka Feeder (Relay menyala agar pakan turun)
+      case 0: // 1. Buka Feeder 
         Serial.println("AUTO: Feeder (Relay) ON, pakan turun...");
         digitalWrite(FEEDER_RELAY_PIN, LOW);
         startTime = now;
         stepAuto = 1;
         break;
 
-      case 1: // 2. Tutup Feeder (Relay mati)
+      case 1: // 2. Tutup Feeder 
         if (now - startTime >= feederDuration) {
           Serial.println("AUTO: Feeder (Relay) OFF.");
           digitalWrite(FEEDER_RELAY_PIN, HIGH);
@@ -201,7 +197,7 @@ void loop() {
         if (now - startTime >= pelontarDuration) {
           Serial.println("AUTO: Pelontar (Servo) Kembali (48°). Siklus Pakan Selesai!");
           pelontarServo.write(48);
-          autoModeActive = false; // Kembalikan ke standby
+          autoModeActive = false; 
         }
         break;
     }
