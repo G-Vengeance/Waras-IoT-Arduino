@@ -5,19 +5,19 @@
 #include <time.h>
 #include <ESP32Servo.h>
 
-// --- PANGGIL FILE FUZZY ---
+// --- PANGGIL FILE FUZZY LEARNING AUTOMATA ---
 #include "FuzzyControl.h" 
 
 // --- KONFIGURASI WIFI & FIREBASE ---
 #define FIREBASE_HOST "https://waras-iot-default-rtdb.asia-southeast1.firebasedatabase.app"
-#define FIREBASE_AUTH "####################################"
+#define FIREBASE_AUTH "#############################" // database auth token
 
-// --- PIN DEFINITIONS (SUDAH DISESUAIKAN TUAN MUDA) ---
+// --- PIN DEFINITIONS ---
 #define RXD2 16 // Modbus RX
 #define TXD2 17 // Modbus TX
 #define PH_SENSOR_PIN 34
-#define DINAMO_RELAY_PIN 27  // Relay untuk Dinamo Pelontar pakan (Muter 5 detik)
-#define FEEDER_SERVO_PIN 12  // Servo untuk Katup penjatuh pakan
+#define DINAMO_RELAY_PIN 27  // Relay untuk Dinamo Pelontar pakan (Muter 2 detik)
+#define FEEDER_SERVO_PIN 12  // Servo untuk Katup penjatuh pakan (Maks 5 detik)
 
 // --- VARIABLES SENSOR ---
 float calibration_value = 21.34; 
@@ -34,10 +34,10 @@ bool autoModeActive = false;
 unsigned long startTime = 0;
 int stepAuto = 0;
 
-// Durasi Katup Servo (Diatur otomatis oleh Fuzzy nanti)
+// Durasi Katup Servo (Diatur otomatis oleh Fuzzy+LA nanti, maks 5000 ms)
 int durasiBukaServo = 0; 
 
-// --- VARIABLES TRIGGER FUZZY ---
+// --- VARIABLES TRIGGER CERDAS ---
 unsigned long lastFeedTime = 0;
 unsigned long feedCooldown = 7200000; // Jeda statis dikunci 2 jam (7200000 ms) agar tidak spam
 
@@ -63,9 +63,6 @@ void setup() {
   Serial2.begin(4800, SERIAL_8N1, RXD2, TXD2);
   delay(2000);
   node.begin(1, Serial2);
-
-  // Inisialisasi Otak Fuzzy
-  setupFuzzy();
 
   // ======================================================================
   // WiFiManager Setup
@@ -154,76 +151,76 @@ void loop() {
             autoModeActive = true;
             stepAuto = 0;
             startTime = millis();
-            durasiBukaServo = 3000; // Standar buka 3 detik kalau dipencet manual dari dashboard
+            durasiBukaServo = 5000; // Buka penuh 5 detik kalau dipencet manual
             Firebase.setBool(firebaseData, "/control/actuators/start_feed", false);
          }
       }
 
-      // 2. Logika Trigger Otomatis berdasarkan FUZZY LOGIC
+      // 2. Logika Trigger Otomatis berdasarkan FUZZY LEARNING AUTOMATA (FLA)
       unsigned long currentMillis = millis();
       
       // Cek apakah sudah lewat 2 jam (cooldown)
       if (!autoModeActive && (lastFeedTime == 0 || (currentMillis - lastFeedTime >= feedCooldown))) {
         
-        float hasilRate = 0;
-        float hasilIntervalJam = 0; // Tidak dipakai karena cooldown dikunci statis
+        // Panggil otak cerdas FLA di tab sebelah (Hanya PH, DO, dan SUHU)
+        float persentasePakan = hitungAksiFLA(phValue, doConcentration, temperature);
 
-        // Panggil otak Fuzzy (Parameter: pH, DO, Suhu)
-        hitungAksiFuzzy(phValue, doConcentration, temperature, hasilRate, hasilIntervalJam);
+        // Jika FLA memutuskan Stop Pakan (0%), batalkan eksekusi aktuator
+        if (persentasePakan <= 0.0) {
+          Serial.println("⛔ FLA MENGHENTIKAN PAKAN! Kondisi air sedang tidak layak.");
+          lastFeedTime = currentMillis; // Reset timer untuk menunggu 2 jam lagi
+        } 
+        else {
+          // --- DEFUSIFIKASI KE SERVO ---
+          // Katup Servo paling lama membuka adalah 5000ms (5 detik) jika Rate 100%
+          durasiBukaServo = (int)((persentasePakan / 100.0) * 5000); 
 
-        // --- DEFUSIFIKASI KE SERVO ---
-        // Asumsi Katup Servo paling lama membuka adalah 3000ms (3 detik) jika Rate 100%
-        durasiBukaServo = (int)((hasilRate / 100.0) * 3000); 
+          // Eksekusi Pakan!
+          autoModeActive = true;
+          stepAuto = 0;
+          startTime = currentMillis;
+          lastFeedTime = currentMillis; 
 
-        // Eksekusi Pakan!
-        autoModeActive = true;
-        stepAuto = 0;
-        startTime = currentMillis;
-        lastFeedTime = currentMillis; 
-
-        Serial.println("=====================================");
-        Serial.println("🧠 FUZZY LOGIC TRIGGERED!");
-        Serial.printf("Rate Pakan: %.2f%% -> Katup Buka: %d ms\n", hasilRate, durasiBukaServo);
-        Serial.println("Dinamo akan berputar 5 detik penuh.");
-        Serial.println("Interval dikunci statis: 2 Jam.");
-        Serial.println("=====================================");
+          Serial.println("=====================================");
+          Serial.println("🎯 EKSEKUSI PAKAN OLEH FLA!");
+          Serial.printf("Rate Pakan Akhir : %.2f%%\n", persentasePakan);
+          Serial.printf("Waktu Buka Katup : %d ms\n", durasiBukaServo);
+          Serial.println("=====================================");
+        }
       }
     }
   }
 
-  // --- D. STATE MACHINE (MODE AUTO DINAMO + SERVO) ---
+  // --- D. STATE MACHINE (ALUR: SERVO MAKS 5S -> DINAMO 2S) ---
   if (autoModeActive) {
     unsigned long now = millis();
     unsigned long elapsedTime = now - startTime;
 
     switch (stepAuto) {
-      case 0: // 1. Nyalakan Dinamo
-        Serial.println("AUTO: Dinamo Pelontar ON (Berputar...)");
-        digitalWrite(DINAMO_RELAY_PIN, LOW); // Relay Nyala
+      case 0: // 1. Buka Katup Servo (Pakan jatuh ke piringan dinamo)
+        Serial.println("AUTO: Katup Feeder DIBUKA! (Pakan dikumpulkan...)");
+        feederServo.write(0); // Posisi Buka
+        startTime = now;      // Mulai hitung mundur durasi servo
         stepAuto = 1;
         break;
 
-      case 1: // 2. Tunggu 1 Detik agar dinamo kencang, lalu Buka Katup Servo
-        if (elapsedTime >= 1000) {
-          Serial.println("AUTO: Katup Feeder DIBUKA! (Pakan jatuh)");
-          feederServo.write(0); // Posisi Buka
+      case 1: // 2. Tunggu waktu Servo habis, Tutup Servo & Nyalakan Dinamo
+        if (elapsedTime >= durasiBukaServo) {
+          Serial.println("AUTO: Katup Feeder DITUTUP.");
+          feederServo.write(48); // Posisi Tutup
+          
+          Serial.println("AUTO: Dinamo Pelontar ON (Menembakkan pakan...)");
+          digitalWrite(DINAMO_RELAY_PIN, LOW); // Relay Dinamo Nyala
+          
+          startTime = now; // Mulai hitung mundur 2 detik untuk dinamo
           stepAuto = 2;
         }
         break;
 
-      case 2: // 3. Tutup Katup Servo setelah durasi Fuzzy habis
-        // Waktu buka katup dihitung setelah detik ke-1
-        if (elapsedTime >= (1000 + durasiBukaServo)) {
-          Serial.println("AUTO: Katup Feeder DITUTUP.");
-          feederServo.write(48); // Posisi Tutup
-          stepAuto = 3;
-        }
-        break;
-
-      case 3: // 4. Matikan Dinamo setelah berputar genap 5 Detik
+      case 2: // 3. Tunggu Dinamo berputar 2 Detik, lalu Matikan
         if (elapsedTime >= 2000) {
           Serial.println("AUTO: Dinamo Pelontar OFF. Siklus Pakan Selesai!");
-          digitalWrite(DINAMO_RELAY_PIN, HIGH); // Relay Mati
+          digitalWrite(DINAMO_RELAY_PIN, HIGH); // Relay Dinamo Mati
           autoModeActive = false; // Kembalikan ke standby menunggu 2 jam
         }
         break;
@@ -237,7 +234,7 @@ void loop() {
 // --- FUNCTIONS ---
 String getYearMonth() {
   struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)) return "2026-04"; 
+  if(!getLocalTime(&timeinfo)) return "2026-05"; 
   char buf[10];
   strftime(buf, sizeof(buf), "%Y-%m", &timeinfo);
   return String(buf);
